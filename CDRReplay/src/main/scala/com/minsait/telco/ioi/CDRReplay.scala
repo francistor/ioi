@@ -22,10 +22,11 @@ object CDRReplay extends App{
     if(args(i) == "--help" || args(i) == "-?") argsMap("help") = "true"
     if(args(i) == "--dir") argsMap("originFolder") = args(i + 1)
     if(args(i) == "--date") argsMap("startDate") = args(i + 1)
+    if(args(i) == "--fastForwardFactor") argsMap("fastForwardFactor") = args(i + 1)
   }
 
   if(argsMap.contains("help") || !argsMap.contains("originFolder") || !argsMap.contains("startDate")){
-    println("Usage: CDRReplay.sh --dir <base directory> --date <yyyy-MM-ddTHH-mm>")
+    println("Usage: CDRReplay.sh --dir <base directory> --date <yyyy-MM-ddTHH-mm> [--timeMachineFactor <factor>]")
     System.exit(0)
   }
 
@@ -35,11 +36,21 @@ object CDRReplay extends App{
   val startDate = argsMap("startDate")
   println(s"Start date $startDate")
 
-  val fileDateFormat = new SimpleDateFormat("yyyy-MM-dd'T'HH-mm")
-  val cdrDateFormat = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss")
+  val fastForwardFactor = argsMap.get("fastForwardFactor") match {
+    case None => 1
+    case Some(factor) => factor.toInt
+  }
+  println(s"Fast forwarding factor: $fastForwardFactor")
 
-  val startTimestamp = fileDateFormat.parse(startDate).getTime
-  val offsetTimestamp = System.currentTimeMillis() - startTimestamp
+  val fileDateFormatString = "yyyy-MM-dd'T'HH-mm"
+  val cdrDateFormatString = "yyyy/MM/dd HH:mm:ss"
+
+  val fileDateFormat = new SimpleDateFormat(fileDateFormatString)
+  val cdrDateFormat = new SimpleDateFormat(cdrDateFormatString)
+
+  val startReplayTimestamp = fileDateFormat.parse(startDate).getTime
+  val startRealTimestamp = System.currentTimeMillis()
+  val timeOffset = startRealTimestamp - startReplayTimestamp
 
   val originFile = new java.io.File(originFolder)
   val leafs = originFile.listFiles(_.isDirectory).toList.map(file => file.getName)
@@ -49,7 +60,9 @@ object CDRReplay extends App{
   kafkaProperties.put("bootstrap.servers", "localhost:9092")
   kafkaProperties.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer")
   kafkaProperties.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer")
+  println("Connecting to Kafka ...")
   val producer = new KafkaProducer[String, String](kafkaProperties)
+  println("Done.")
 
   val tasks = leafs.map{leaf => Future{dirLoop(s"$originFolder/$leaf")}}
 
@@ -58,10 +71,14 @@ object CDRReplay extends App{
   producer.close()
 
   def dirLoop(folderName: String): Unit = {
+    // Thread safety
+    val fileDateFormat = new SimpleDateFormat(fileDateFormatString)
+    val cdrDateFormat = new SimpleDateFormat(cdrDateFormatString)
+
     var consecutiveMissingFiles = 0
     try {
-      for (i <- 0 to 1) {
-        val fileTimestamp = startTimestamp + i * 1000 * 60
+      for (i <- 0 to 1000) {
+        val fileTimestamp = startReplayTimestamp + i * 1000 * 60
         val currentFileName = s"$folderName/cdr.${fileDateFormat.format(new java.util.Date(fileTimestamp))}.txt"
         if (new java.io.File(currentFileName).isFile) {
           consecutiveMissingFiles = 0
@@ -71,7 +88,7 @@ object CDRReplay extends App{
             DatedCDR(cdrDateFormat.parse(cdrFields(0)), cdrFields)
           }).foreach(datedCDR => {
             // Wait if necessary
-            while (datedCDR.date.getTime > System.currentTimeMillis - offsetTimestamp) Thread.sleep(100)
+            while (datedCDR.date.getTime + timeOffset > fakeNow) Thread.sleep(300)
             pushCDR(datedCDR)
           })
           file.close
@@ -83,7 +100,10 @@ object CDRReplay extends App{
         }
       }
     } catch {
-      case e: Exception => print("Exception ", e.getStackTrace)
+      case e: Exception =>
+        print("Exception ", e.getMessage)
+        e.printStackTrace()
+        System.exit(-1)
     }
   }
 
@@ -94,7 +114,14 @@ object CDRReplay extends App{
     val record = new ProducerRecord[String, String]("cdr", cdrFields(12) + "-" + cdrFields(3) + "-" + cdrFields(4), datedCDR.cdrFields.mkString(","))
 
     producer.send(record)
+
+    // Debug
     println(datedCDR.cdrFields.mkString(","))
+  }
+
+  // Fake current timestamp assuming the configured fast-forward factor
+  def fakeNow(): Long = {
+    startRealTimestamp + (System.currentTimeMillis - startRealTimestamp) * fastForwardFactor
   }
 
 }
