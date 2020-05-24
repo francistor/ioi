@@ -1,11 +1,13 @@
 package com.minsait.telco.ioi.cdranalyzer
 
 import java.sql.Timestamp
+import java.util.Date
 
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.types._
 
 object StringImplicits {
+  /*
   implicit class StringImprovements(val s: String){
     import scala.util.control.Exception.catching
 
@@ -14,9 +16,106 @@ object StringImplicits {
     def toTimestampSafe: Any =  catching(classOf[IllegalArgumentException]).opt(Timestamp.valueOf(s.replaceAll("/", "-"))).orNull
     def mayBeEmpty: Any = if(s.length == 0) null else s
   }
+   */
+
+  implicit class StringImprovements(val s: String){
+    import scala.util.control.Exception.catching
+
+    def toIntSafe: Int = catching(classOf[NumberFormatException]).opt(s.toInt).getOrElse(0)
+    def toLongSafe: Long = catching(classOf[NumberFormatException]).opt(s.toLong).getOrElse(0)
+    def toTimestamp: java.sql.Timestamp =  Timestamp.valueOf(s.replaceAll("/", "-"))
+    def mayBeEmpty: String = if(s.length == 0) "" else s
+  }
+}
+
+object CDR {
+  def fromString(s: String): CDR = {
+    import StringImplicits._
+
+    val fields = s.split(",")
+    CDR(
+      Timestamp.valueOf(fields(0).replaceAll("/", "-")),  // Date
+      fields(1).toLongSafe, // Timestamp
+      fields(2), // Acct-Status-Type
+      fields(3), // Acct-Session-Id
+      fields(4).toLongSafe, // Acct-Session-Time
+      fields(5).toLongSafe, // Acct-Output-Octets
+      fields(6).toLongSafe, // Acct-Output-Gigawords
+      fields(7).toLongSafe, // Acct-Input-Octets
+      fields(8).toLongSafe, // Acct-Input-Gigawords
+      fields(11), // NAS-Identifier
+      fields(12), // NAS-IP-Address
+      fields(13).toLongSafe, // NAS-Port
+      fields(14).mayBeEmpty, // ClientId
+      fields(15).mayBeEmpty, // AccessType
+      fields(16).mayBeEmpty, // User-Name
+      fields(17).mayBeEmpty, // Calling-Station-Id
+      fields(18).mayBeEmpty, // DSLForum-Agent-Circuit-Id
+      fields(19).mayBeEmpty, // DSLForum-Agent-Remote-Id
+      fields(20).mayBeEmpty, // Framed-IP-Address
+      fields(21).mayBeEmpty, // Connect-Info
+      fields(22).mayBeEmpty, // Acct-Terminate-Cause
+      fields(27).mayBeEmpty // User-Mac
+    )
+  }
+}
+
+case class CDR(
+                date: java.sql.Timestamp,
+                timestamp: Long,
+                acctStatusType: String,
+                acctSessionId: String,
+                sessionTime: Long,
+                outputOctets: Long,
+                outputGigawords: Long,
+                inputOctets: Long,
+                inputGigawords: Long,
+                nasIdentifier: String,
+                nasIpAddress: String,
+                nasPort: Long,
+                clientId: String,
+                accessType: String,
+                userName: String,
+                callingStationId: String,
+                circuitId: String,
+                remoteId: String,
+                framedIPAddress: String,
+                connectInfo: String,
+                terminateCause: String,
+                mac: String
+              ){
+
+
+
+  def toTuple: (java.sql.Timestamp, Long, String, String, Long, Long, Long, Long, Long, String, String, Long, String, String, String, String, String, String, String, String, String, String) = (
+    date,               // 1
+    timestamp,          // 2
+    acctStatusType,     // 3
+    acctSessionId,      // 4
+    sessionTime,        // 5
+    outputOctets,       // 6
+    outputGigawords,    // 7
+    inputOctets,        // 8
+    inputGigawords,     // 9
+    nasIdentifier,      // 10
+    nasIpAddress,       // 11
+    nasPort,            // 12
+    clientId,           // 13
+    accessType,         // 14
+    userName,           // 15
+    callingStationId,   // 16
+    circuitId,          // 17
+    remoteId,           // 18
+    framedIPAddress,    // 19
+    connectInfo,        // 20
+    terminateCause,     // 21
+    mac                 // 22
+  )
 }
 
 object CDRSchema {
+
+  import StringImplicits._
 
   val schema: StructType = StructType(Seq(
     StructField("Date", TimestampType, nullable = false),
@@ -58,17 +157,15 @@ object CDRSchema {
        */
   ))
 
-  import StringImplicits._
-
   def stringToCDR(row: String): Row = {
     val fields = row.split(",")
     try {
       Row(
-        fields(0).toTimestampSafe, // Date
+        fields(0).toTimestamp, // Date
         fields(1).toLongSafe, // Timestamp
         fields(2), // Acct-Status-Type
         fields(3), // Acct-Session-Id
-        fields(4), // Acct-Session-Time
+        fields(4).toLongSafe, // Acct-Session-Time
         fields(5).toLongSafe, // Acct-Output-Octets
         fields(6).toLongSafe, // Acct-Output-Gigawords
         fields(7).toLongSafe, // Acct-Input-Octets
@@ -107,6 +204,7 @@ object CDRSchema {
     }
 
   }
+
 }
 /*
 
