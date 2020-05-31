@@ -1,153 +1,180 @@
 package com.minsait.telco.ioi.cdranalyzer
 
-import java.sql.Timestamp
+// https://www.elastic.co/guide/en/elasticsearch/hadoop/master/spark.html#spark-streaming
+// https://github.com/sksamuel/elastic4s
+
 
 import org.apache.spark._
-import org.apache.spark.sql.{Row, SparkSession}
-import org.apache.spark.streaming._
-import org.apache.kafka.common.serialization.StringDeserializer
+import org.apache.spark.sql.{ForeachWriter, SaveMode, SparkSession}
+import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
-import org.apache.spark.streaming.kafka010._
-import org.apache.spark.streaming.kafka010.LocationStrategies.PreferConsistent
-import org.apache.spark.streaming.kafka010.ConsumerStrategies.Subscribe
 
+import scala.sys.process._
 
-object CDRAnalyzer extends App{
+object CDRAnalyzer extends App {
 
-  private val conf = new SparkConf().setMaster("local[2]").setAppName("CDRAnalyzer")
+  case class AggMetric1(window: (java.sql.Timestamp, java.sql.Timestamp), aggField1: String, values: Array[Long], sampleSize: Int)
+  case class AggMetricStats1(aggField1: String, mean: Double, stdDev: Double, samples: Int)
+  case class KafkaMetric(key: String, value: String)
 
+  evalAnomalies()
+  System.exit(0)
+
+  private val conf = new SparkConf()
+    .setMaster("local[4]")
+    .setAppName("CDRAnalyzer")
+    .set("es.index.auto.create", "true")
+
+  "rm -rf /tmp/spark/checkpoints" !
+
+  // Use this version
   structured()
 
 
-
+  /**
+   * Version with structured streaming
+   */
   def structured(): Unit = {
     val ss = SparkSession.builder().config(conf).getOrCreate()
 
     import ss.implicits._
 
-    def toCDRItems = ss.udf.register[
-        (
-          java.sql.Timestamp, // Date
-          Long,   // Timestamp
-          String, // AcctStatusType
-          String, // AcctSessionId
-          Long,   // SessionTime
-          Long,   // OutputOctets
-          Long,   // OutputGigawords
-          Long,   // InputOctets,
-          Long,   // InputGigawords
-          String, // NASIdentifier
-          String, // NASIPAddress
-          Long,   // NASPort
-          String, // ClientId
-          String,   // AccessType
-          String, // UserName
-          String, // CallingStationId
-          String, // CircuitId
-          String, // RemoteId
-          String, // FramedIPAddress,
-          String, // ConnectInfo
-          String, // TerminateCause
-          String  // MAC
+    ///////////////////////////////////////////////////////////////
+    // Raw CDR Stream --> 10s aggregate
+    ///////////////////////////////////////////////////////////////
 
-        ),
-      String]("toCDRItems", (s: String) => {
-        CDR.fromString(s).toTuple
-    })
-
-    val cdrStringDataFrame = ss
+    val cdrStringDF = ss
       .readStream
       .format("kafka")
       .option("kafka.bootstrap.servers", "localhost:9092")
       .option("subscribe", "cdr")
       .load()
 
-    val cdrDF = cdrStringDataFrame.withColumn("CDRItems", toCDRItems($"value"))
-        .withColumn("Date", $"CDRItems._1")
-        .withColumn("Timestamp", $"CDRItems._2")
-        .withColumn("AcctStatusType", $"CDRItems._3")
-        .withColumn("AcctSessionId", $"CDRItems._4")
-        .withColumn("SessionTime", $"CDRItems._5")
-        .withColumn("OutputOctets", $"CDRItems._6")
-        .withColumn("OutputGigawords", $"CDRItems._7")
-        .withColumn("InputOctets", $"CDRItems._8")
-        .withColumn("InputGigawords", $"CDRItems._9")
-        .withColumn("NASIdentifier", $"CDRItems._10")
-        .withColumn("NASIPAddress", $"CDRItems._11")
-        .withColumn("NASPort", $"CDRItems._12")
-        .withColumn("ClientId", $"CDRItems._13")
-        .withColumn("AccessType", $"CDRItems._14")
-        .withColumn("UserName", $"CDRItems._15")
-        .withColumn("CallingStationId", $"CDRItems._16")
-        .withColumn("CircuitId", $"CDRItems._17")
-        .withColumn("RemoteId", $"CDRItems._18")
-        .withColumn("FramedIPAddress", $"CDRItems._19")
-        .withColumn("ConnectInfo", $"CDRItems._20")
-        .withColumn("TerminateCause", $"CDRItems._21")
-        .withColumn("MAC", $"CDRItems._22")
+    val cdrStreamDS = cdrStringDF.as[(String, String, String, Int, Long, java.sql.Timestamp, Int)].map(item => CDR.fromString(item._2))
 
-    cdrDF.printSchema()
+    val agg_cdr_alive_bras_10s = cdrStreamDS
+      .withWatermark("date", "3 seconds")
+      .filter($"acctStatusType" === "Alive")
+      .groupBy(window($"date", "10 seconds", "5 seconds"), $"nasIPAddress".as("aggField1"))
+      .agg(count("nasIPAddress").as("value"))
+      .withColumn("metricName", lit("agg_cdr_alive_bras_10s"))
+      .withColumn("timestamp", $"window.end")
+      .as[Metric1]
 
-    val query = cdrDF.groupBy("NASIPAddress").count().writeStream
-      .outputMode("complete")
-      .format("console")
-      .trigger(Trigger.ProcessingTime("5 seconds"))
+    val debug_output_agg_cdr_alive_bras_10s = agg_cdr_alive_bras_10s
+      .writeStream
+      .outputMode("append")
+      .trigger(Trigger.ProcessingTime("10 seconds"))
+      .foreachBatch((ds, _) => {
+        ds.show(10, truncate = false)
+        println("number of agg", ds.count + " " + Thread.currentThread().getName)
+      })
       .start()
 
-    query.awaitTermination()
+    val es_output_agg_cdr_alive_bras_10s = agg_cdr_alive_bras_10s
+      .withColumn("nasIPAddress", $"aggField1")
+      .writeStream
+      .outputMode("append")
+      .trigger(Trigger.ProcessingTime("10 seconds"))
+      .option("checkpointLocation", "/tmp/spark/checkpoints/es_output_agg_cdr_alive_bras_10s")
+      .format("es")
+      .start("agg_cdr")
+
+    val kafka_output_agg_cdr_alive_bras_10s = agg_cdr_alive_bras_10s.map(aggMetric => KafkaMetric(s"${aggMetric.timestamp}-${aggMetric.aggField1}", s"agg_cdr_alive_bras_10s,${aggMetric.timestamp},${aggMetric.aggField1},${aggMetric.value}"))
+      .writeStream
+      .outputMode("append")
+      .option("checkpointLocation", "/tmp/spark/checkpoints/kafka_output_agg_cdr_alive_bras_10s")
+      .trigger(Trigger.ProcessingTime("10 seconds"))
+      .format("kafka")
+      .option("topic", "agg_cdr")
+      .option("kafka.bootstrap.servers", "localhost:9092")
+      .start()
+
+    ///////////////////////////////////////////////////////////////
+    // 10s agg CDR Stream --> 1m aggregate
+    ///////////////////////////////////////////////////////////////
+    val aggCDRStreamDF = ss
+      .readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", "localhost:9092")
+      .option("subscribe", "agg_cdr")
+      .load()
+
+    val aggCDRStreamDS = aggCDRStreamDF.as[(String, String, String, Int, Long, java.sql.Timestamp, Int)].map(item => Metrics.m1FromString(item._2))
+
+    val agg2_cdr_alive_bras_1m_DS = aggCDRStreamDS
+      .filter($"metricName" === "agg_cdr_alive_bras_10s")
+      .withWatermark("timestamp", "30 seconds")
+      .groupBy(window($"timestamp", "1 minute","30 seconds"), $"aggField1")
+      .agg(collect_list("value").as("values"))
+      .withColumn("sampleSize", lit(12))
+      .as[AggMetric1].map(
+        aggMetric => {
+          // Fill missing values
+          val size = aggMetric.values.length
+          val filledValues = aggMetric.values ++ Array.fill[Long](aggMetric.sampleSize - size)(0)
+          val mean = aggMetric.values.sum / aggMetric.sampleSize
+          val stdDev = math.sqrt(filledValues.map(v => (v - mean) * (v - mean)).sum / aggMetric.sampleSize)
+          AggMetricStats1(aggMetric.aggField1, mean, stdDev, size)
+        })
+
+
+    val debug_output_agg_cdr_alive_bras_1m_DS = agg2_cdr_alive_bras_1m_DS
+      .writeStream
+      .outputMode("append")
+      .trigger(Trigger.ProcessingTime("30 seconds"))
+      .foreachBatch((ds, _) => {
+        ds.show(200, truncate = false)
+        println("number of agg2", ds.count)
+      })
+      .start()
+
+    val es_output_agg_cdr_alive_bras_1m_DS = agg2_cdr_alive_bras_1m_DS
+      .withColumn("nasIPAddress", $"aggField1")
+      .withColumn("timestamp", lit(new java.sql.Timestamp(System.currentTimeMillis())))
+      .writeStream
+      .outputMode("append")
+      .trigger(Trigger.ProcessingTime("30 seconds"))
+      .option("checkpointLocation", "/tmp/spark/checkpoints/es_output_agg_cdr_alive_bras_1m_DS")
+      .format("es")
+      .start("agg2_cdr")
+
+
+
+    // Wait for termination
+    kafka_output_agg_cdr_alive_bras_10s.awaitTermination()
   }
 
-  def microBatch(): Unit = {
-    val ssc = new StreamingContext(conf, Seconds(2))
+  // http://localhost:9200/agg2_cdr/_search?default_operator=AND&q= +nasIPAddress:212.230.100.102 +timestamp:>1590927410825
+  def evalAnomalies(): Unit = {
+    import com.sksamuel.elastic4s.ElasticDsl._
+    import com.sksamuel.elastic4s.http.JavaClient
+    import com.sksamuel.elastic4s.requests.searches.SearchResponse
+    import com.sksamuel.elastic4s.{ElasticClient, ElasticProperties, RequestFailure, RequestSuccess}
 
-    val kafkaParams = Map[String, Object](
-      "bootstrap.servers" -> "localhost:9092",
-      "key.deserializer" -> classOf[StringDeserializer],
-      "value.deserializer" -> classOf[StringDeserializer],
-      "group.id" -> "myGroupId",
-      "auto.offset.reset" -> "earliest",
-      "enable.auto.commit" -> (false: java.lang.Boolean)
-    )
+    val props = ElasticProperties("http://localhost:9200")
+    val client = ElasticClient(JavaClient(props))
 
-    val topics = Array("cdr")
+    val resp = client.execute {
+      search("agg2_cdr").query("default_operator=AND&q= +nasIPAddress:212.230.100.102 +timestamp:>1590927410825")
+    }.await
 
-    val stream = KafkaUtils.createDirectStream[String, String](
-      ssc,
-      PreferConsistent,
-      Subscribe[String, String](topics, kafkaParams)
-    )
+    // resp is a Response[+U] ADT consisting of either a RequestFailure containing the
+    // Elasticsearch error details, or a RequestSuccess[U] that depends on the type of request.
+    // In this case it is a RequestSuccess[SearchResponse]
 
-    stream.foreachRDD { rdd =>
-
-      // Get the singleton instance of SparkSession
-      val session = SparkSession.builder.config(rdd.sparkContext.getConf).getOrCreate()
-      import session.implicits._
-
-      // Convert RDD[String] to DataFrame
-      val cdrRDD = rdd.map(record => CDRSchema.stringToCDR(record.value))
-      val cdrDF = session.createDataFrame(cdrRDD, CDRSchema.schema)
-      println(cdrDF.count)
-
-      /*
-      // Create a temporary view
-      wordsDataFrame.createOrReplaceTempView("words")
-
-      // Do word count on DataFrame using SQL and print it
-      val wordCountsDataFrame =
-        spark.sql("select word, count(*) as total from words group by word")
-      wordCountsDataFrame.show()
-
-       */
+    println("---- Search Results ----")
+    resp match {
+      case failure: RequestFailure => println("We failed " + failure.error)
+      case results: RequestSuccess[SearchResponse] =>
+        val a = results.result.hits.hits
+        // get _source Map[String, AnyRef]
+        println(results.result.hits.hits.toList)
+        println(System.currentTimeMillis())
+      case results: RequestSuccess[_] => println(results.result)
     }
-
-    // val a = stream.map(record => (record.key, record.value))
-
-    ssc.start()
-    ssc.awaitTermination()
   }
-
 }
-
 
 
 
