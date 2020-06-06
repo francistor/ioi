@@ -29,39 +29,40 @@ import StringImplicits._
 /**
  * Holds case classes for Metrics
  */
-object Metrics {
-  def m1FromString(s: String): Metric1 = {
+object FOAggs {
+  def foAgg1FromString(s: String): FOAggregation1 = {
     val items = s.split(",")
-    Metric1(items(0), Timestamp.valueOf(items(1)), items(2), items(3).toLongSafe)
+    FOAggregation1(items(0), Timestamp.valueOf(items(1)), items(3).toLongSafe, items(2))
   }
 
-  def m2FromString(s: String): Metric2 = {
+  def foAgg2FromString(s: String): FOAggregation2 = {
     val items = s.split(",")
-    Metric2(items(0), Timestamp.valueOf(items(1)), items(2), items(3), items(4).toLongSafe)
+    FOAggregation2(items(0), Timestamp.valueOf(items(1)), items(4).toLongSafe, items(2), items(3))
   }
 
-  def m3FromString(s: String): Metric3 = {
+  def foAgg3FromString(s: String): FOAggregation3 = {
     val items = s.split(",")
-    Metric3(items(0), Timestamp.valueOf(items(1)), items(2), items(3), items(4), items(5).toLongSafe)
+    FOAggregation3(items(0), Timestamp.valueOf(items(1)), items(5).toLongSafe, items(2), items(3), items(4))
   }
 
-  def m4FromString(s: String): Metric4 = {
+  def foAgg4FromString(s: String): FOAggregation4 = {
     val items = s.split(",")
-    Metric4(items(0), Timestamp.valueOf(items(1)), items(2), items(3), items(4), items(5), items(7).toLongSafe)
-  }
-
-  def m5FromString(s: String): Metric5 = {
-    val items = s.split(",")
-    Metric5(items(0), Timestamp.valueOf(items(1)), items(2), items(3), items(4), items(5), items(6), items(7).toLongSafe)
+    FOAggregation4(items(0), Timestamp.valueOf(items(1)), items(6).toLongSafe, items(2), items(3), items(4), items(5))
   }
 }
 
-case class Metric1(metricName: String, timestamp: Timestamp, aggField1: String, value: Long)
-case class Metric2(metricName: String, timestamp: Timestamp, aggField1: String, aggField2: String, value: Long)
-case class Metric3(metricName: String, timestamp: Timestamp, aggField1: String, aggField2: String, aggField3: String, value: Long)
-case class Metric4(metricName: String, timestamp: Timestamp, aggField1: String, aggField2: String, aggField3: String, aggField4: String, value: Long)
-case class Metric5(metricName: String, timestamp: Timestamp, aggField1: String, aggField2: String, aggField3: String, aggField4: String, aggField5: String, value: Long)
+abstract class FOAggregation(aggName: String, timestamp: Timestamp, value: Long){
+  def aggName: String
+  def timestamp: Timestamp
+  def value: Long
+}
+case class FOAggregation1(aggName: String, timestamp: Timestamp, value: Long, aggField1: String) extends FOAggregation(aggName, timestamp, value)
+case class FOAggregation2(aggName: String, timestamp: Timestamp, value: Long, aggField1: String, aggField2: String) extends FOAggregation(aggName, timestamp, value)
+case class FOAggregation3(aggName: String, timestamp: Timestamp, value: Long, aggField1: String, aggField2: String, aggField3: String) extends FOAggregation(aggName, timestamp, value)
+case class FOAggregation4(aggName: String, timestamp: Timestamp, value: Long, aggField1: String, aggField2: String, aggField3: String, aggField4: String) extends FOAggregation(aggName, timestamp, value)
 
+case class SOAggregation1Raw(window: (java.sql.Timestamp, java.sql.Timestamp), aggField1: String, values: Array[Long], sampleSize: Int)
+case class SOAggregation1Stats(aggName: String, timestamp: java.sql.Timestamp, aggField1: String, mean: Double, stdDev: Double, samples: Int)
 
 object CDR {
   def fromString(s: String): CDR = {
@@ -124,7 +125,7 @@ case class CDR(
                 inputOctets: Long,
                 inputGigawords: Long,
                 nasIdentifier: String,
-                nasIPAddress: String,
+                nasIpAddress: String,
                 nasPort: Long,
                 clientId: String,
                 accessType: String,

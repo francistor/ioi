@@ -4,177 +4,323 @@ package com.minsait.telco.ioi.cdranalyzer
 // https://github.com/sksamuel/elastic4s
 
 
-import org.apache.spark._
-import org.apache.spark.sql.{ForeachWriter, SaveMode, SparkSession}
+import java.util.Properties
+
+import com.sksamuel.elastic4s.ElasticDsl.indexInto
+import com.sksamuel.elastic4s.http.JavaClient
+import com.sksamuel.elastic4s.{ElasticClient, ElasticProperties}
+import org.apache.kafka.clients.producer.{KafkaProducer, ProducerRecord}
+import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.streaming.Trigger
 
+import scala.concurrent.ExecutionContext.Implicits.global
 import scala.sys.process._
+import scala.util.{Failure, Success}
+import com.typesafe.config.ConfigFactory
+import org.apache.spark.SparkConf
 
 object CDRAnalyzer extends App {
 
-  case class AggMetric1(window: (java.sql.Timestamp, java.sql.Timestamp), aggField1: String, values: Array[Long], sampleSize: Int)
-  case class AggMetricStats1(aggField1: String, mean: Double, stdDev: Double, samples: Int)
-  case class KafkaMetric(key: String, value: String)
 
-  evalAnomalies()
-  System.exit(0)
+  val appConf = ConfigFactory.load()
 
-  private val conf = new SparkConf()
-    .setMaster("local[4]")
+
+  private val sparkConf = new SparkConf()
+    .setMaster("local[*]")
     .setAppName("CDRAnalyzer")
-    .set("es.index.auto.create", "true")
+
 
   "rm -rf /tmp/spark/checkpoints" !
 
-  // Use this version
-  structured()
+  // Initialize Elastic
+  {
+    import com.sksamuel.elastic4s.ElasticDsl._
+    val props = ElasticProperties(appConf.getString("elastic.url"))
+    val client = ElasticClient(JavaClient(props))
+    client.execute {
+      createIndex("agg_cdr")
+      createIndex("agg2_cdr")
+    }.await
+  }
+
+
+  brasAlive()
 
 
   /**
    * Version with structured streaming
    */
-  def structured(): Unit = {
-    val ss = SparkSession.builder().config(conf).getOrCreate()
+  def brasAlive(): Unit = {
+    val ss = SparkSession.builder().config(sparkConf).getOrCreate()
 
     import ss.implicits._
 
+    val brasAgg1Seconds = appConf.getInt("analyzer.brasAgg1Seconds")
+    val brasAgg2Seconds = appConf.getInt("analyzer.brasAgg2Seconds")
+    val brasStdDevAnomaly = appConf.getInt("analyzer.brasStdDevAnomaly")
+
+    if(! (brasAgg2Seconds % brasAgg1Seconds == 0)) throw new Exception("brasAgg2Seconds is not a multiple of brasAgg1Seconds")
+
     ///////////////////////////////////////////////////////////////
-    // Raw CDR Stream --> 10s aggregate
+    // Raw CDR Stream --> 1st order aggregate
     ///////////////////////////////////////////////////////////////
 
     val cdrStringDF = ss
       .readStream
       .format("kafka")
-      .option("kafka.bootstrap.servers", "localhost:9092")
+      .option("kafka.bootstrap.servers", appConf.getString("kafka.bootstrapServers"))
       .option("subscribe", "cdr")
       .load()
 
     val cdrStreamDS = cdrStringDF.as[(String, String, String, Int, Long, java.sql.Timestamp, Int)].map(item => CDR.fromString(item._2))
 
-    val agg_cdr_alive_bras_10s = cdrStreamDS
+    // Aggregate count by NASIpAddress
+    val agg1_cdr_alive_bras = cdrStreamDS
       .withWatermark("date", "3 seconds")
       .filter($"acctStatusType" === "Alive")
-      .groupBy(window($"date", "10 seconds", "5 seconds"), $"nasIPAddress".as("aggField1"))
-      .agg(count("nasIPAddress").as("value"))
-      .withColumn("metricName", lit("agg_cdr_alive_bras_10s"))
+      .groupBy(window($"date", s"${2*brasAgg1Seconds} seconds", s"$brasAgg1Seconds seconds"), $"nasIpAddress".as("aggField1"))
+      .agg(count("nasIpAddress").as("value"))
+      .withColumn("aggName", lit("agg1_cdr_alive_bras"))
       .withColumn("timestamp", $"window.end")
-      .as[Metric1]
+      .as[FOAggregation1]
 
-    val debug_output_agg_cdr_alive_bras_10s = agg_cdr_alive_bras_10s
+    // Write to multiple outputs
+    val agg_cdr_writer = agg1_cdr_alive_bras
       .writeStream
       .outputMode("append")
-      .trigger(Trigger.ProcessingTime("10 seconds"))
+      .trigger(Trigger.ProcessingTime("5 seconds"))
       .foreachBatch((ds, _) => {
+        println("------------- agg --------------")
         ds.show(10, truncate = false)
-        println("number of agg", ds.count + " " + Thread.currentThread().getName)
-      })
-      .start()
 
-    val es_output_agg_cdr_alive_bras_10s = agg_cdr_alive_bras_10s
-      .withColumn("nasIPAddress", $"aggField1")
-      .writeStream
-      .outputMode("append")
-      .trigger(Trigger.ProcessingTime("10 seconds"))
-      .option("checkpointLocation", "/tmp/spark/checkpoints/es_output_agg_cdr_alive_bras_10s")
-      .format("es")
-      .start("agg_cdr")
+        ds.foreachPartition(aggList => {
 
-    val kafka_output_agg_cdr_alive_bras_10s = agg_cdr_alive_bras_10s.map(aggMetric => KafkaMetric(s"${aggMetric.timestamp}-${aggMetric.aggField1}", s"agg_cdr_alive_bras_10s,${aggMetric.timestamp},${aggMetric.aggField1},${aggMetric.value}"))
-      .writeStream
-      .outputMode("append")
-      .option("checkpointLocation", "/tmp/spark/checkpoints/kafka_output_agg_cdr_alive_bras_10s")
-      .trigger(Trigger.ProcessingTime("10 seconds"))
-      .format("kafka")
-      .option("topic", "agg_cdr")
-      .option("kafka.bootstrap.servers", "localhost:9092")
-      .start()
+          // ES
+          val props = ElasticProperties(appConf.getString("elastic.url"))
+          val client = ElasticClient(JavaClient(props))
+
+          // Kafka
+          val kafkaProperties = new Properties()
+          kafkaProperties.put("bootstrap.servers", appConf.getString("kafka.bootstrapServers"))
+          kafkaProperties.put("key.serializer", "org.apache.kafka.common.serialization.StringSerializer")
+          kafkaProperties.put("value.serializer", "org.apache.kafka.common.serialization.StringSerializer")
+          val producer = new KafkaProducer[String, String](kafkaProperties)
+
+          val esOperationList = aggList.map(agg => {
+            // Write to Kafka
+            val record = new ProducerRecord[String, String]("agg_cdr", s"${agg.timestamp}-${agg.aggField1}", s"agg1_cdr_alive_bras,${agg.timestamp},${agg.aggField1},${agg.value}")
+            producer.send(record)
+
+            evalAnomaly(client, List("nasIpAddress"), List(agg.aggField1), "agg2_cdr_alive_bras", agg.value, brasStdDevAnomaly)
+
+            agg match {
+              case FOAggregation1(aggName, timestamp, value, aggField1) =>
+                indexInto("agg_cdr").fields(Map(
+                  "value" -> agg.value,
+                  "timestamp" -> agg.timestamp.getTime,
+                  "aggName" -> agg.aggName,
+                  "aggField1" -> aggField1,
+                  "nasIpAddress" -> aggField1
+                ))
+            }
+          }).toList
+
+          producer.close()
+
+          import com.sksamuel.elastic4s.ElasticDsl._
+          client.execute {
+            bulk(esOperationList)
+          }.onComplete {
+              case Success(s) =>
+                client.close()
+              case Failure(e) =>
+                println(e)
+                client.close()
+          }
+        })
+      }).start()
+
 
     ///////////////////////////////////////////////////////////////
-    // 10s agg CDR Stream --> 1m aggregate
+    // agg1 CDR Stream --> agg2
     ///////////////////////////////////////////////////////////////
+
+    // Read from Kafka
     val aggCDRStreamDF = ss
       .readStream
       .format("kafka")
-      .option("kafka.bootstrap.servers", "localhost:9092")
+      .option("kafka.bootstrap.servers", appConf.getString("kafka.bootstrapServers"))
       .option("subscribe", "agg_cdr")
       .load()
 
-    val aggCDRStreamDS = aggCDRStreamDF.as[(String, String, String, Int, Long, java.sql.Timestamp, Int)].map(item => Metrics.m1FromString(item._2))
+    val aggCDRStreamDS = aggCDRStreamDF.as[(String, String, String, Int, Long, java.sql.Timestamp, Int)].map(item => FOAggs.foAgg1FromString(item._2))
 
-    val agg2_cdr_alive_bras_1m_DS = aggCDRStreamDS
-      .filter($"metricName" === "agg_cdr_alive_bras_10s")
-      .withWatermark("timestamp", "30 seconds")
-      .groupBy(window($"timestamp", "1 minute","30 seconds"), $"aggField1")
+    val agg2_cdr_alive_bras_DS = aggCDRStreamDS
+      .filter($"aggName" === "agg1_cdr_alive_bras")
+      .withWatermark("timestamp", "5 seconds")
+      .groupBy(window($"timestamp", s"${2*brasAgg2Seconds} seconds",s"$brasAgg2Seconds seconds"), $"aggField1")
       .agg(collect_list("value").as("values"))
-      .withColumn("sampleSize", lit(12))
-      .as[AggMetric1].map(
-        aggMetric => {
-          // Fill missing values
-          val size = aggMetric.values.length
-          val filledValues = aggMetric.values ++ Array.fill[Long](aggMetric.sampleSize - size)(0)
-          val mean = aggMetric.values.sum / aggMetric.sampleSize
-          val stdDev = math.sqrt(filledValues.map(v => (v - mean) * (v - mean)).sum / aggMetric.sampleSize)
-          AggMetricStats1(aggMetric.aggField1, mean, stdDev, size)
+      .withColumn("sampleSize", lit(2 * brasAgg2Seconds / brasAgg1Seconds))
+      .as[SOAggregation1Raw].map(
+        agg2 => {
+          // Fill missing values. Should be "sampleSize" values.
+          val size = agg2.values.length
+          val filledValues = agg2.values ++ Array.fill[Long](agg2.sampleSize - size)(0)
+          val mean = agg2.values.sum / agg2.sampleSize
+          val stdDev = math.sqrt(filledValues.map(v => (v - mean) * (v - mean)).sum / agg2.sampleSize)
+          SOAggregation1Stats("agg2_cdr_alive_bras", agg2.window._2, agg2.aggField1, mean, stdDev, size)
         })
 
-
-    val debug_output_agg_cdr_alive_bras_1m_DS = agg2_cdr_alive_bras_1m_DS
+    agg2_cdr_alive_bras_DS
       .writeStream
       .outputMode("append")
       .trigger(Trigger.ProcessingTime("30 seconds"))
       .foreachBatch((ds, _) => {
+        println("------------- agg2 --------------")
         ds.show(200, truncate = false)
-        println("number of agg2", ds.count)
+        ds.foreachPartition(aggList => {
+
+          // ES
+          val props = ElasticProperties(appConf.getString("elastic.url"))
+          val client = ElasticClient(JavaClient(props))
+
+          val esOperationList = aggList.map {
+            case agg@SOAggregation1Stats(aggName, timestamp, aggField1, mean, stdDev, samples) =>
+              indexInto("agg2_cdr").fields(Map(
+                "mean" -> mean,
+                "stdDev" -> stdDev,
+                "timestamp" -> timestamp.getTime,
+                "aggName" -> aggName,
+                "aggField1" -> aggField1,
+                "nasIpAddress" -> aggField1
+              ))
+          }.toList
+
+          import com.sksamuel.elastic4s.ElasticDsl._
+          client.execute {
+            bulk(esOperationList)
+          }.onComplete {
+            case Success(s) =>
+              client.close()
+            case Failure(e) =>
+              println(e)
+              client.close()
+          }
+        })
       })
       .start()
 
-    val es_output_agg_cdr_alive_bras_1m_DS = agg2_cdr_alive_bras_1m_DS
-      .withColumn("nasIPAddress", $"aggField1")
-      .withColumn("timestamp", lit(new java.sql.Timestamp(System.currentTimeMillis())))
-      .writeStream
-      .outputMode("append")
-      .trigger(Trigger.ProcessingTime("30 seconds"))
-      .option("checkpointLocation", "/tmp/spark/checkpoints/es_output_agg_cdr_alive_bras_1m_DS")
-      .format("es")
-      .start("agg2_cdr")
-
-
 
     // Wait for termination
-    kafka_output_agg_cdr_alive_bras_10s.awaitTermination()
+    agg_cdr_writer.awaitTermination()
   }
 
-  // http://localhost:9200/agg2_cdr/_search?default_operator=AND&q= +nasIPAddress:212.230.100.102 +timestamp:>1590927410825
-  def evalAnomalies(): Unit = {
+  // http://localhost:9200/agg2_cdr/_search?default_operator=AND&q= +nasIpAddress:212.230.100.102 +timestamp:>1590927410825
+  def evalAnomaly(client: ElasticClient, aggNames: List[String], aggValues: List[String], aggregationName: String, currentValue: Long, nStdDev: Int): Unit = {
     import com.sksamuel.elastic4s.ElasticDsl._
-    import com.sksamuel.elastic4s.http.JavaClient
     import com.sksamuel.elastic4s.requests.searches.SearchResponse
-    import com.sksamuel.elastic4s.{ElasticClient, ElasticProperties, RequestFailure, RequestSuccess}
+    import com.sksamuel.elastic4s.{RequestFailure, RequestSuccess}
 
-    val props = ElasticProperties("http://localhost:9200")
-    val client = ElasticClient(JavaClient(props))
+    val targetTimestamp = System.currentTimeMillis() - 1000 * 30 * 5
 
-    val resp = client.execute {
-      search("agg2_cdr").query("default_operator=AND&q= +nasIPAddress:212.230.100.102 +timestamp:>1590927410825")
-    }.await
+    val query = s"default_operator=AND&q= +timestamp:>$targetTimestamp" + aggNames.zip(aggValues).map{case (n, v) => s" +$n:$v"}.mkString("")
 
-    // resp is a Response[+U] ADT consisting of either a RequestFailure containing the
-    // Elasticsearch error details, or a RequestSuccess[U] that depends on the type of request.
-    // In this case it is a RequestSuccess[SearchResponse]
+    client.execute {
+      search("agg2_cdr").query(query)
+    }.onComplete{
+      case Success(resp) =>
+        resp match {
+          case failure: RequestFailure => println("Error searching Elastisearch" + failure.error)
+          case results: RequestSuccess[SearchResponse] =>
 
-    println("---- Search Results ----")
-    resp match {
-      case failure: RequestFailure => println("We failed " + failure.error)
-      case results: RequestSuccess[SearchResponse] =>
-        val a = results.result.hits.hits
-        // get _source Map[String, AnyRef]
-        println(results.result.hits.hits.toList)
-        println(System.currentTimeMillis())
-      case results: RequestSuccess[_] => println(results.result)
+            val hits = results.result.hits.hits.toList
+            if(hits.nonEmpty) {
+              val mostRecentHit = hits.reduceLeft((x, y) => if (x.sourceAsMap("timestamp").asInstanceOf[Long] > y.sourceAsMap("timestamp").asInstanceOf[Long]) x else y)
+              val mean = mostRecentHit.sourceAsMap("mean").asInstanceOf[Double]
+              val stdDev = mostRecentHit.sourceAsMap("stdDev").asInstanceOf[Double]
+              val offset = System.currentTimeMillis() - mostRecentHit.sourceAsMap("timestamp").asInstanceOf[Long]
+              if((mean - currentValue) > nStdDev * stdDev) println(s"Anomaly $aggregationName for ${aggNames.zip(aggValues).mkString(":")} value: $currentValue [$mean, $stdDev] offset: ${offset / 1000} seconds")
+            }
+        }
+      case Failure(e) =>
+        println("Error querying ES", e)
     }
+
   }
 }
 
+// Template creation
+// http://localhost:9200/_template/agg_cdr
+/**
+{
+  "index_patterns": [
+  "agg_cdr*",
+  "agg2_cdr*"
+  ],
+  "settings": {
+  "number_of_shards": 1,
+  "number_of_replicas": 0
+},
+  "mappings": {
+  "_source": {
+  "enabled": true
+},
+  "properties": {
+  "metricName": {
+  "type": "keyword"
+},
+  "timestamp": {
+  "type": "date"
+},
+  "date": {
+  "type": "date"
+},
+  "count": {
+  "type": "long"
+},
+  "value": {
+  "type": "long"
+},
+  "samples": {
+  "type": "long"
+},
+  "avg": {
+  "type": "double"
+},
+  "stdDev": {
+  "type": "double"
+},
+  "nasIpAddress": {
+  "type": "keyword"
+},
+  "accessNode": {
+  "type": "keyword"
+},
+  "isShort":{
+  "type": "boolean"
+},
+  "acctTerminateCause":{
+  "type": "keyword"
+},
+  "accessType":{
+  "type": "keyword"
+},
+  "aggField1":{
+  "type": "keyword"
+},
+  "aggField2":{
+  "type": "keyword"
+},
+  "aggField3":{
+  "type": "keyword"
+},
+  "aggField4":{
+  "type": "keyword"
+}
+}
 
+}
+}
+*/
 

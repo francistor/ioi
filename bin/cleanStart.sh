@@ -16,14 +16,16 @@ sleep 5
 # Create topic
 echo creating topic ...
 $KAFKA_HOME/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --topic cdr 2>&1 > /dev/null
+$KAFKA_HOME/bin/kafka-topics.sh --create --bootstrap-server localhost:9092 --replication-factor 1 --partitions 1 --topic agg_cdr 2>&1 > /dev/null
 
 # Set retention time
-echo setting retention time for 'cdr' topic ...
+echo setting retention time for topics
 $KAFKA_HOME/bin/kafka-configs.sh --bootstrap-server localhost:9092 --entity-type topics --alter --entity-name cdr --add-config retention.ms=60000
+$KAFKA_HOME/bin/kafka-configs.sh --bootstrap-server localhost:9092 --entity-type topics --alter --entity-name agg_cdr --add-config retention.ms=600000
 
 sleep 3
 
 # Launch CDRReplay
-$HOME/ioi/CDRReplay/target/universal/stage/bin/cdrreplay --fastForwardFactor 1 --dir /home/francisco/data --date 2019-12-04T00-00
+$HOME/ioi/CDRReplay/target/universal/stage/bin/cdrreplay --print --fastForwardFactor 1 --dir /home/francisco/data --date 2019-12-04T00-00
 
 echo done.

@@ -22,6 +22,8 @@ object CDRReplay extends App{
     if(args(i) == "--help" || args(i) == "-?") argsMap("help") = "true"
     if(args(i) == "--dir") argsMap("originFolder") = args(i + 1)
     if(args(i) == "--date") argsMap("startDate") = args(i + 1)
+    if(args(i) == "--doNotChangeDate") argsMap("doNotChangeDate") = "true"
+    if(args(i) == "--print") argsMap("print") = "true"
     if(args(i) == "--fastForwardFactor") argsMap("fastForwardFactor") = args(i + 1)
   }
 
@@ -35,6 +37,9 @@ object CDRReplay extends App{
 
   val startDate = argsMap("startDate")
   println(s"Start date $startDate")
+
+  val doNotChangeDate = argsMap.getOrElse("doNotChangeDate", "false").toBoolean
+  val printCDR = argsMap.getOrElse("print", "false").toBoolean
 
   val fastForwardFactor = argsMap.get("fastForwardFactor") match {
     case None => 1
@@ -66,7 +71,7 @@ object CDRReplay extends App{
 
   val tasks = leafs.map{leaf => Future{dirLoop(s"$originFolder/$leaf")}}
 
-  Await.result(Future.reduceLeft(tasks)((_,_) => ()), 1000.seconds)
+  Await.result(Future.reduceLeft(tasks)((_,_) => ()), 1000.hours)
 
   producer.close()
 
@@ -77,7 +82,7 @@ object CDRReplay extends App{
 
     var consecutiveMissingFiles = 0
     try {
-      for (i <- 0 to 1000) {
+      for (i <- 0 to 1000000) {
         val fileTimestamp = startReplayTimestamp + i * 1000 * 60
         val currentFileName = s"$folderName/cdr.${fileDateFormat.format(new java.util.Date(fileTimestamp))}.txt"
         if (new java.io.File(currentFileName).isFile) {
@@ -89,7 +94,7 @@ object CDRReplay extends App{
           }).foreach(datedCDR => {
             // Wait if necessary
             while (datedCDR.date.getTime + timeOffset > fakeNow) Thread.sleep(300)
-            pushCDR(datedCDR)
+            pushCDR(datedCDR, cdrDateFormat)
           })
           file.close
         } else {
@@ -107,8 +112,10 @@ object CDRReplay extends App{
     }
   }
 
-  def pushCDR(datedCDR: DatedCDR): Unit = {
+  def pushCDR(datedCDR: DatedCDR, df: SimpleDateFormat): Unit = {
     val cdrFields = datedCDR.cdrFields
+
+    if(!doNotChangeDate) cdrFields(0) = df.format(new java.util.Date())
 
     // Key is NAS-IP-Address plus AcctSessionId plus duration
     val record = new ProducerRecord[String, String]("cdr", cdrFields(12) + "-" + cdrFields(3) + "-" + cdrFields(4), datedCDR.cdrFields.mkString(","))
@@ -116,7 +123,7 @@ object CDRReplay extends App{
     producer.send(record)
 
     // Debug
-    println(datedCDR.cdrFields.mkString(","))
+    if(printCDR) println(datedCDR.cdrFields.mkString(","))
   }
 
   // Fake current timestamp assuming the configured fast-forward factor

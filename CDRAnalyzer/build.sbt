@@ -8,6 +8,7 @@ enablePlugins(JavaAppPackaging)
 
 libraryDependencies ++=
   Seq(
+    "com.typesafe" % "config" % "1.4.0",
     "org.apache.spark" %% "spark-sql" % "2.4.5",
     "org.apache.spark" %% "spark-streaming" 	 % "2.4.5" % "provided",
     "org.apache.spark" %% "spark-streaming-kafka-0-10" % "2.4.5",
