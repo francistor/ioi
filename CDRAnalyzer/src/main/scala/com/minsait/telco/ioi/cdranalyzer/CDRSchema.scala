@@ -141,4 +141,3 @@ case class CDR(
                 accessNode: String,
                 day: String
               )
-

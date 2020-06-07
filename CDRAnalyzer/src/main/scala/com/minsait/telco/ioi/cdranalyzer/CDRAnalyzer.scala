@@ -19,6 +19,10 @@ import scala.sys.process._
 import scala.util.{Failure, Success}
 import com.typesafe.config.ConfigFactory
 import org.apache.spark.SparkConf
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.clustering.{KMeans, KMeansModel}
+import org.apache.spark.ml.feature.{Interaction, OneHotEncoderEstimator, StringIndexer, StringIndexerModel}
+import org.apache.spark.sql.expressions.Window
 
 object CDRAnalyzer extends App {
 
@@ -33,26 +37,24 @@ object CDRAnalyzer extends App {
 
   "rm -rf /tmp/spark/checkpoints" !
 
-  // Initialize Elastic
-  {
-    import com.sksamuel.elastic4s.ElasticDsl._
-    val props = ElasticProperties(appConf.getString("elastic.url"))
-    val client = ElasticClient(JavaClient(props))
-    client.execute {
-      createIndex("agg_cdr")
-      createIndex("agg2_cdr")
-    }.await
-  }
+  val ss = SparkSession.builder().config(sparkConf).getOrCreate()
 
 
-  brasAlive()
+  badSessionPattern()
 
 
-  /**
-   * Version with structured streaming
-   */
   def brasAlive(): Unit = {
-    val ss = SparkSession.builder().config(sparkConf).getOrCreate()
+
+    // Initialize Elastic
+    {
+      import com.sksamuel.elastic4s.ElasticDsl._
+      val props = ElasticProperties(appConf.getString("elastic.url"))
+      val client = ElasticClient(JavaClient(props))
+      client.execute {
+        createIndex("agg_cdr")
+        createIndex("agg2_cdr")
+      }.await
+    }
 
     import ss.implicits._
 
@@ -79,7 +81,7 @@ object CDRAnalyzer extends App {
     val agg1_cdr_alive_bras = cdrStreamDS
       .withWatermark("date", "3 seconds")
       .filter($"acctStatusType" === "Alive")
-      .groupBy(window($"date", s"${2*brasAgg1Seconds} seconds", s"$brasAgg1Seconds seconds"), $"nasIpAddress".as("aggField1"))
+      .groupBy(window($"date", s"${2 * brasAgg1Seconds} seconds", s"$brasAgg1Seconds seconds"), $"nasIpAddress".as("aggField1"))
       .agg(count("nasIpAddress").as("value"))
       .withColumn("aggName", lit("agg1_cdr_alive_bras"))
       .withColumn("timestamp", $"window.end")
@@ -89,7 +91,7 @@ object CDRAnalyzer extends App {
     val agg_cdr_writer = agg1_cdr_alive_bras
       .writeStream
       .outputMode("append")
-      .trigger(Trigger.ProcessingTime("5 seconds"))
+      .trigger(Trigger.ProcessingTime(s"$brasAgg1Seconds seconds"))
       .foreachBatch((ds, _) => {
         println("------------- agg --------------")
         ds.show(10, truncate = false)
@@ -159,7 +161,7 @@ object CDRAnalyzer extends App {
     val agg2_cdr_alive_bras_DS = aggCDRStreamDS
       .filter($"aggName" === "agg1_cdr_alive_bras")
       .withWatermark("timestamp", "5 seconds")
-      .groupBy(window($"timestamp", s"${2*brasAgg2Seconds} seconds",s"$brasAgg2Seconds seconds"), $"aggField1")
+      .groupBy(window($"timestamp", s"${2 * brasAgg2Seconds} seconds",s"$brasAgg2Seconds seconds"), $"aggField1")
       .agg(collect_list("value").as("values"))
       .withColumn("sampleSize", lit(2 * brasAgg2Seconds / brasAgg1Seconds))
       .as[SOAggregation1Raw].map(
@@ -175,7 +177,7 @@ object CDRAnalyzer extends App {
     agg2_cdr_alive_bras_DS
       .writeStream
       .outputMode("append")
-      .trigger(Trigger.ProcessingTime("30 seconds"))
+      .trigger(Trigger.ProcessingTime(s"$brasAgg2Seconds seconds"))
       .foreachBatch((ds, _) => {
         println("------------- agg2 --------------")
         ds.show(200, truncate = false)
@@ -247,6 +249,89 @@ object CDRAnalyzer extends App {
         println("Error querying ES", e)
     }
 
+  }
+
+  def badSessionPattern(): Unit = {
+
+    import ss.implicits._
+
+    ///////////////////////////////////////////////////////////////
+    // Raw CDR Stream --> 1st order aggregate
+    ///////////////////////////////////////////////////////////////
+
+    val termCauseAgg1Seconds = appConf.getInt("analyzer.termCauseAgg1Seconds")
+
+    val cdrStringDF = ss
+      .readStream
+      .format("kafka")
+      .option("kafka.bootstrap.servers", appConf.getString("kafka.bootstrapServers"))
+      .option("subscribe", "cdr")
+      .load()
+
+    val cdrStreamDS = cdrStringDF.as[(String, String, String, Int, Long, java.sql.Timestamp, Int)].map(item => CDR.fromString(item._2))
+
+    val agg1_cdr_stop_bras_termCause = cdrStreamDS
+      .withWatermark("date", "10 seconds")
+      .filter($"acctStatusType" === "Stop")
+      .groupBy(window($"date", s"${2*termCauseAgg1Seconds} seconds", s"$termCauseAgg1Seconds seconds"),
+        $"nasIpAddress".as("aggField1"),
+        $"terminateCause".as("aggField2"))
+      .agg(count($"*").as("value"))
+      .withColumn("aggName", lit("agg1_cdr_stop_bras_termCause"))
+      .withColumn("timestamp", $"window.end")
+      .as[FOAggregation2]
+
+    val strQuery = agg1_cdr_stop_bras_termCause
+      .writeStream
+      .outputMode("append")
+      .trigger(Trigger.ProcessingTime(s"$termCauseAgg1Seconds seconds"))
+      .foreachBatch((ds, _) => {
+        val df = ds.toDF
+          .withColumn("sumPerBras", sum($"value").over(Window.partitionBy($"aggField1")))
+          .withColumn("ratioInBras", $"value"/$"sumPerBras")
+
+        // To assign float labels to the termination causes
+        val termCauseIndexer = new StringIndexer().setInputCol("aggField2").setOutputCol("terminateCauseIndex")
+        // To encode the float labels in a vector
+        val termCauseEncoder = new OneHotEncoderEstimator().setDropLast(false).setInputCols(Array("terminateCauseIndex")).setOutputCols(Array("featuresNotScaled"))
+        // Scale with the number of clients per BRAS. The scaled feature is "featuresUA". Not needed here
+        val multiplier = new Interaction().setInputCols(Array("featuresNotScaled", "ratioInBras")).setOutputCol("featuresScaled")
+        // This pipeline calculates the normalized features
+        val featuresCalculatorModel = new Pipeline().setStages(Array(termCauseIndexer, termCauseEncoder, multiplier)).fit(df)
+        // DF with features
+        val vectorSum = new VectorSum
+        val df_withFeatures = featuresCalculatorModel.transform(df).groupBy($"aggField1").agg(vectorSum($"featuresScaled").alias("features"), min($"sumPerBras")).cache
+
+        df_withFeatures.orderBy("aggField1").show(30, false)
+
+        if(df_withFeatures.count > 1) { // To avoid exception
+          val kModel = new Pipeline().setStages(Array(new KMeans().setK(2).setSeed(1L))).fit(df_withFeatures)
+
+          val predictions = kModel.transform(df_withFeatures)
+
+          predictions.show(30, false)
+
+          // Cluster centers
+          val termCauseCenter = kModel.stages(0).asInstanceOf[KMeansModel].clusterCenters
+          println(termCauseCenter.mkString)
+
+          // UDF to calculate the distance from the center, taken from the "centersBRAS" array
+          import org.apache.spark.ml.linalg.{Vector, Vectors}
+          val distFromCenter = udf((tCauseVector: Vector, c: Int) => Vectors.sqdist(tCauseVector, termCauseCenter(c)))
+
+          val decoratedPredictions = predictions.withColumn("distanceFromCenter", distFromCenter($"features", $"prediction")).cache
+
+          // Get outliers, which are the points whose distance to center is higher than N x standard deviations
+          val distanceStats = decoratedPredictions.describe("distanceFromCenter").cache
+          val distanceStdDev = distanceStats.where($"summary" === "stddev").first.getString(1).toFloat
+          val distanceMean = distanceStats.where($"summary" === "mean").first.getString(1).toFloat
+
+          decoratedPredictions.where($"distanceFromCenter" > distanceMean + 2 * distanceStdDev).show(100, false)
+        }
+
+      }).start()
+
+    strQuery.awaitTermination()
   }
 }
 
